@@ -73,23 +73,34 @@ async function fetchAllPages(baseUrl: string, typeParam?: string) {
   let allResults = parseAnimeList($, $("article"));
   
   if (maxPage > 1) {
-    const promises = [];
+    const urls = [];
     for (let i = 2; i <= maxPage; i++) {
-      const url = typeParam ? `${baseUrl}page/${i}/?type=${typeParam}` : `${baseUrl}page/${i}/`;
-      promises.push(
+      urls.push(typeParam ? `${baseUrl}page/${i}/?type=${typeParam}` : `${baseUrl}page/${i}/`);
+    }
+    
+    // Process in chunks of 5 to avoid rate limits
+    const chunkSize = 5;
+    for (let i = 0; i < urls.length; i += chunkSize) {
+      const chunk = urls.slice(i, i + chunkSize);
+      const promises = chunk.map(url => 
         axios.get(url, {
           headers: {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
           }
         }).catch(() => null)
       );
-    }
-    
-    const results = await Promise.all(promises);
-    for (const r of results) {
-      if (r && r.status === 200) {
-        const $page = cheerio.load(r.data);
-        allResults = allResults.concat(parseAnimeList($page, $page("article")));
+      
+      const results = await Promise.all(promises);
+      for (const r of results) {
+        if (r && r.status === 200) {
+          const $page = cheerio.load(r.data);
+          allResults = allResults.concat(parseAnimeList($page, $page("article")));
+        }
+      }
+      
+      // Small delay between chunks
+      if (i + chunkSize < urls.length) {
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
   }
@@ -245,6 +256,29 @@ app.get("/api/anime/hindidub", async (req, res) => {
   }
 });
 
+async function fetchAnilistId(title: string): Promise<number | null> {
+  try {
+    const query = `
+      query ($search: String) {
+        Media (search: $search, type: ANIME) {
+          id
+        }
+      }
+    `;
+    const variables = { search: title };
+    const response = await axios.post("https://graphql.anilist.co", { query, variables }, {
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      }
+    });
+    return response.data?.data?.Media?.id || null;
+  } catch (error: any) {
+    console.error("Failed to fetch Anilist ID:", error.message);
+    return null;
+  }
+}
+
 app.get("/api/anime/info", async (req, res) => {
   try {
     const { id } = req.query;
@@ -339,9 +373,12 @@ app.get("/api/anime/info", async (req, res) => {
         });
       }
 
+      const anilistId = await fetchAnilistId(title);
+
       return {
         id,
         title,
+        anilistId,
         type,
         description,
         image: image ? (image.startsWith("//") ? "https:" + image : image) : null,
@@ -562,7 +599,17 @@ app.get("/api/anime/stream", async (req, res) => {
           const extractorUrl = `https://hindi-dub-extractor-apia-1.jhshamim81.workers.dev/api/extract?url=${encodeURIComponent(targetStream.link)}`;
           const extractorRes = await axios.get(extractorUrl);
           if (extractorRes.data && extractorRes.data.success) {
-            return { ...extractorRes.data, originalStreams: streams };
+            const extractedData = extractorRes.data;
+            const urls: any[] = [];
+            if (extractedData.files) {
+              for (const [lang, fileData] of Object.entries(extractedData.files)) {
+                urls.push({
+                  language: lang,
+                  url: (fileData as any).m3u8_url
+                });
+              }
+            }
+            return { ...extractedData, urls, originalStreams: streams };
           }
         } catch (extractError: any) {
           console.error("Extractor error:", extractError.message);
@@ -570,7 +617,7 @@ app.get("/api/anime/stream", async (req, res) => {
         }
       }
 
-      return { streams };
+      return { streams, urls: [] };
     });
 
     res.json(data);
